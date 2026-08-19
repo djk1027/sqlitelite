@@ -35,6 +35,8 @@ typedef enum {
 	STATEMENT_SELECT
 } StatementType;
 
+typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
+
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
 
@@ -68,6 +70,56 @@ const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 /* 테이블에 들어갈 수 있는 최대 로우 수 */
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+/*
+ * Common Node Header Layout
+ */
+const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
+const uint32_t NODE_TYPE_OFFSET = 0;
+const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE;
+const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
+const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const uint8_t COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+/*
+ * Leaf Node Header Layout
+ */
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+/*
+ * Leaf Node Body Layout
+ */
+const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_KEY_OFFSET = 0;
+const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+/* 
+ * 리프 노트 필드 접근
+ */
+uint32_t *leaf_node_num_cells(void *node) {
+	return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
+
+void *leaf_node_cell(void *node, uint32_t cell_num) {
+	return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+}
+
+uint32_t *leaf_node_key(void *node, uint32_t cell_num) {
+	return leaf_node_cell(node, cell_num);
+}
+
+void *leaf_node_value(void *node, uint32_t cell_num) {
+	return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+}
+
+void initialize_leaf_node(void *node) { *leaf_node_num_cells(node) = 0; }
+
 /* 페이저 구조체 
    페이지 캐시, 파일에 접근
    테이블 객체는 페이저를 통해 페이지 요청*/
@@ -83,6 +135,13 @@ typedef struct {
 	Pager *pager;
 	void *pages[TABLE_MAX_PAGES];
 } Table;
+
+/* 커서 구조체 : 테이블 내 위치를 나타내는 객체 */
+typedef struct {
+	Table *table;
+	uint32_t row_num;
+	bool end_of_table; // Indicates a position one past the last element 
+} Cursor;
 
 void print_row(Row *row) {
 	printf("(%d, %s, %s)\n", row->id, row->username, row->email);
@@ -178,9 +237,10 @@ void *get_page(Pager *pager, uint32_t page_num) {
 }
 
 /* row_num에 맞는 페이지 주소 + byte_offset을 반환 */
-void *row_slot(Table *table, uint32_t row_num) {
+void *cursor_value(Cursor *cursor) {
+	uint32_t row_num = cursor->row_num;
 	uint32_t page_num = row_num / ROWS_PER_PAGE;
-	void *page = get_page(table->pager, page_num);
+	void *page = get_page(cursor->table->pager, page_num);
 	uint32_t row_offset = row_num % ROWS_PER_PAGE;
 	uint32_t byte_offset = row_offset * ROW_SIZE;
 	return page + byte_offset;
@@ -258,6 +318,31 @@ void free_table(Table *table) {
 	free(table);
 }
 
+Cursor *table_start(Table *table) {
+	Cursor *cursor = malloc(sizeof(Cursor));
+	cursor->table = table;
+	cursor->row_num = 0;
+	cursor->end_of_table = (table->num_rows == 0);
+	
+	return cursor;
+}
+
+Cursor *table_end(Table *table) {
+	Cursor *cursor = malloc(sizeof(Cursor));
+	cursor->table = table;
+	cursor->row_num = table->num_rows;
+	cursor->end_of_table = true;
+
+	return cursor;
+}
+
+void cursor_advance(Cursor *cursor) {
+	cursor->row_num += 1;
+	if (cursor->row_num >= cursor->table->num_rows) {
+		cursor->end_of_table = true;
+	}
+}
+
 InputBuffer *new_input_buffer() {
 	InputBuffer *input_buffer = (InputBuffer *)malloc(sizeof(InputBuffer));
 	input_buffer->buffer = NULL;
@@ -308,19 +393,25 @@ ExecuteResult execute_insert(Statement *Statement, Table *table) {
 	}
 
 	Row *row_to_insert = &(Statement->row_to_insert);
+	Cursor *cursor = table_end(table);
 
-	serialize_row(row_to_insert, row_slot(table, table->num_rows));
+	serialize_row(row_to_insert, cursor_value(cursor));
 	table->num_rows += 1;
 
 	return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement *statement, Table *table) {
+	Cursor *cursor = table_start(table);
+
 	Row row;
-	for (uint32_t i = 0; i < table->num_rows; i++) {
-		deserialize_row(row_slot(table, i), &row);
+	while (!(cursor->end_of_table)) {
+		deserialize_row(cursor_value(cursor), &row);
 		print_row(&row);
+		cursor_advance(cursor);
 	}
+
+	free(cursor);
 	return EXECUTE_SUCCESS;
 }
 
